@@ -5,20 +5,21 @@ import os
 import sys 
 
 # --- CONFIGURAÇÕES ---
-# ⚠️ IMPORTANTE: Cole sua NOVA chave abaixo
-API_KEY = "RGAPI-01b2d9ba-db4f-47f2-878b-f8afce4da7d1" 
+# ⚠️ COLOQUE SUA CHAVE ABAIXO
+API_KEY = "RGAPI-8d34b713-b106-4956-9759-b47a7075d081" 
 
 REGION_API = "br1"       
 MATCH_API = "americas"   
-MATCHES_PER_PLAYER = 50 
+MATCHES_PER_PLAYER = 100  # Aumentado para garantir cobertura total do patch
 QUEUE_TYPE = "RANKED_SOLO_5x5"
 
 # ⚠️ CONFIGURAÇÃO DE CONTINUAÇÃO
-# Se parou no [131/200], coloque 130 aqui para reiniciar desse jogador
-START_INDEX = 130 
+START_INDEX = 0
 
 # Caminhos
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) # Ajustado para rodar no diretorio atual
+if not os.path.exists(os.path.join(BASE_DIR, 'data')):
+    os.makedirs(os.path.join(BASE_DIR, 'data'))
 DB_PATH = os.path.join(BASE_DIR, 'data', 'lol_database.db')
 
 # Headers Padrão
@@ -27,23 +28,16 @@ HEADERS = {"X-Riot-Token": API_KEY}
 def init_match_db(conn):
     """
     Recria o banco de dados com a estrutura MAIS COMPLETA POSSÍVEL.
-    Atenção: Isso apaga dados antigos de partidas.
     """
     cursor = conn.cursor()
-    print("🔄 Recriando estrutura do banco de dados (Schema Completo)...")
-    
-    # Limpeza
-    tables = [
-        'match_timeline_participants',
-        'match_timeline_stats', 
-        'match_participants', 
-        'match_bans', 
-        'match_teams', 
-        'matches'
-    ]
-    for t in tables:
-        cursor.execute(f"DROP TABLE IF EXISTS {t}")
+    # Verifica se a tabela já existe para não resetar sem querer
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='matches'")
+    if cursor.fetchone():
+        print("⚠️ Tabela 'matches' já existe. Mantendo dados atuais.")
+        return
 
+    print("🔄 Criando estrutura do banco de dados (Schema Completo)...")
+    
     # 1. Tabela Principal (Meta)
     cursor.execute('''
         CREATE TABLE matches (
@@ -140,7 +134,7 @@ def print_progress(player_idx, total_players, player_name, current_match, total_
     """Exibe uma barra de progresso limpa que se sobrescreve."""
     
     # Barra de progresso dos jogos do jogador atual
-    bar_len = 20
+    bar_len = 15
     if total_matches > 0:
         filled_len = int(bar_len * current_match // total_matches)
         pct = (current_match / total_matches) * 100
@@ -151,10 +145,10 @@ def print_progress(player_idx, total_players, player_name, current_match, total_
     bar = "█" * filled_len + "-" * (bar_len - filled_len)
     
     # Formata a string (limitando o tamanho do nome para não quebrar linha)
-    p_name = (player_name[:12] + '..') if len(player_name) > 12 else player_name
+    p_name = (player_name[:10] + '..') if len(player_name) > 10 else player_name
     
     # \r volta pro inicio, \033[K limpa o resto da linha
-    msg = f"\r[{player_idx}/{total_players}] {p_name:<14} |{bar}| {pct:.0f}% ({current_match}/{total_matches}) | DB: {total_saved} | {status}"
+    msg = f"\r[{player_idx}/{total_players}] {p_name:<12} |{bar}| {pct:.0f}% | DB: {total_saved} | {status}"
     
     # Garante que a linha apague o texto anterior se for mais curto
     sys.stdout.write(msg + "\033[K") 
@@ -163,11 +157,10 @@ def print_progress(player_idx, total_players, player_name, current_match, total_
 # --- FUNÇÕES DE API ---
 
 def request_riot(url):
-    """Wrapper com rate limit silencioso (só grita se der erro)."""
+    """Wrapper com rate limit silencioso."""
     retries = 0
     while retries < 5:
         try:
-            # Removido print de debug para não poluir a barra
             resp = requests.get(url, headers=HEADERS)
             
             if resp.status_code == 200:
@@ -175,7 +168,6 @@ def request_riot(url):
             
             elif resp.status_code == 429:
                 retry_after = int(resp.headers.get('Retry-After', 5))
-                # Se for um wait longo, avisa, senão dorme quieto
                 if retry_after > 5:
                     print(f"\n⏳ Rate Limit! Pausa de {retry_after}s...")
                 time.sleep(retry_after)
@@ -183,19 +175,18 @@ def request_riot(url):
                 continue
                 
             elif resp.status_code == 403:
-                print(f"\n❌ ERRO 403: API Key inválida.")
-                return None
+                print(f"\n❌ ERRO 403: API Key inválida ou expirada.")
+                sys.exit(1) # Para o script se a chave for ruim
                 
             elif resp.status_code == 404:
                 return None 
                 
             else:
-                # Erros desconhecidos a gente loga
-                print(f"\n⚠️ Erro {resp.status_code}: {url}")
-                return None
+                # Erros de servidor (500, 503)
+                time.sleep(2)
+                retries += 1
                 
         except Exception as e:
-            print(f"\nErro de conexão: {e}")
             time.sleep(2)
             retries += 1
             
@@ -204,26 +195,38 @@ def request_riot(url):
 def get_current_patch_prefix():
     data = request_riot("https://ddragon.leagueoflegends.com/api/versions.json")
     if data:
+        # Ex: "14.3.1" -> "14.3"
         return ".".join(data[0].split(".")[:2])
     return None
 
 def get_high_elo_players():
+    """
+    Busca TODOS os jogadores de Challenger, Grandmaster e Master.
+    """
     tiers = [
         ("Desafiante", "challengerleagues"),
         ("Grão-Mestre", "grandmasterleagues"),
         ("Mestre", "masterleagues")
     ]
+    
+    all_players = []
+    
     for tier_name, endpoint in tiers:
-        print(f"🔍 Verificando {tier_name}...")
+        print(f"🔍 Baixando lista de {tier_name}...")
         url = f"https://{REGION_API}.api.riotgames.com/lol/league/v4/{endpoint}/by-queue/{QUEUE_TYPE}"
         data = request_riot(url)
         
-        if data and 'entries' in data and len(data['entries']) > 0:
+        if data and 'entries' in data:
             players = data['entries']
+            # Ordena por LP apenas para garantir que pegamos os melhores primeiro se o script parar
             players.sort(key=lambda x: x['leaguePoints'], reverse=True)
-            print(f"✅ Encontrados {len(players)} jogadores no {tier_name}.")
-            return players
-    return []
+            all_players.extend(players)
+            print(f"   -> {len(players)} jogadores adicionados.")
+        
+        time.sleep(1) # Pequena pausa entre requests de liga
+            
+    print(f"✅ Total de jogadores High Elo encontrados: {len(all_players)}")
+    return all_players
 
 def get_puuid(summoner_id):
     url = f"https://{REGION_API}.api.riotgames.com/lol/summoner/v4/summoners/{summoner_id}"
@@ -231,6 +234,7 @@ def get_puuid(summoner_id):
     return data['puuid'] if data else None
 
 def get_match_ids(puuid, count):
+    # queue=420 é Ranked Solo/Duo
     url = f"https://{MATCH_API}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count={count}&queue=420"
     return request_riot(url) or []
 
@@ -252,6 +256,7 @@ def save_match_full(details, timeline, conn):
     info = details['info']
     match_id = details['metadata']['matchId']
     
+    # Dupla verificação para segurança
     if match_exists_in_db(conn, match_id): return False
 
     winner_team = 0
@@ -289,7 +294,6 @@ def save_match_full(details, timeline, conn):
             perk_sub = p['perks']['styles'][1]['style']
         except: pass
 
-        # Tupla com EXATAMENTE 39 valores para corresponder às 39 colunas
         values = (
             match_id, p['puuid'], p['championId'], p['teamId'], p['participantId'], p['win'],
             p['kills'], p['deaths'], p['assists'], 
@@ -307,7 +311,6 @@ def save_match_full(details, timeline, conn):
             p.get('lane', 'NONE'), p.get('role', 'NONE')
         )
         
-        # Gera os placeholders dinamicamente (39 '?,') para evitar erro de contagem manual
         placeholders = ",".join(["?"] * len(values))
         cursor.execute(f'INSERT INTO match_participants VALUES ({placeholders})', values)
 
@@ -332,13 +335,12 @@ def _process_timeline_snapshots(match_id, timeline_data, conn):
         p_frames = current_frame['participantFrames']
         for p_id_str, p_data in p_frames.items():
             p_id = int(p_id_str)
+            # Safe check for team ID logic (participants 1-5 = 100, 6-10 = 200)
             team = 100 if p_id <= 5 else 200
             
             p_gold = p_data['totalGold']
             p_xp = p_data['xp']
             p_minions = p_data['minionsKilled'] + p_data['jungleMinionsKilled']
-            p_level = p_data['level']
-            p_pos = p_data.get('position', {'x':0, 'y':0})
             
             cursor.execute('''INSERT INTO match_timeline_participants VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
                 (match_id, minute, p_id, p_gold, p_data['currentGold'], p_xp, p_data['level'],
@@ -349,6 +351,7 @@ def _process_timeline_snapshots(match_id, timeline_data, conn):
             team_stats[team]['xp'] += p_xp
             team_stats[team]['minions'] += p_minions
             
+        # Events Aggregation
         for i in range(minute + 1):
             for event in frames[i]['events']:
                 ev_type = event['type']
@@ -375,30 +378,35 @@ def _process_timeline_snapshots(match_id, timeline_data, conn):
 
 def run():
     patch_prefix = get_current_patch_prefix()
-    if not patch_prefix: return
-    print(f"\n🎯 Crawler Iniciado | Patch: {patch_prefix}.x\n")
+    if not patch_prefix: 
+        print("❌ Erro ao detectar patch atual.")
+        return
+        
+    print(f"\n🎯 Crawler Iniciado | Foco: Patch {patch_prefix}.x Completo\n")
     
     conn = sqlite3.connect(DB_PATH)
+    init_match_db(conn)
     
-    # --- RESET ---
-    # init_match_db(conn) # <--- COMENTADO PARA NÃO APAGAR DADOS!
-    # -------------
+    all_high_elo = get_high_elo_players()
+    if not all_high_elo: return
     
-    challengers = get_high_elo_players()
-    if not challengers: return
-    
-    # Calcula quantos já temos salvos para exibir no log
+    # Estatísticas iniciais
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM matches")
     total_saved = cursor.fetchone()[0]
     
-    processed_matches = set() 
-    total_players = len(challengers)
+    # Conjunto para cache rápido de memória (evita bater no DB toda hora para check)
+    # Carregando IDs já existentes para memória para performance extrema
+    print("⏳ Carregando cache de partidas existentes...")
+    cursor.execute("SELECT match_id FROM matches")
+    processed_matches = set(row[0] for row in cursor.fetchall())
+    print(f"📦 Cache carregado: {len(processed_matches)} partidas ignoradas se aparecerem novamente.")
+
+    total_players = len(all_high_elo)
     
-    print(f"Retomando a partir do jogador {START_INDEX + 1}...")
+    print(f"\n🚀 Iniciando coleta a partir do índice {START_INDEX}...\n")
     
-    for i, player in enumerate(challengers):
-        # PULA OS JOGADORES JÁ PROCESSADOS
+    for i, player in enumerate(all_high_elo):
         if i < START_INDEX:
             continue
             
@@ -412,7 +420,7 @@ def run():
         puuid = None
         if 'puuid' in player: puuid = player['puuid']
         elif 'summonerId' in player:
-            time.sleep(0.8)
+            time.sleep(0.1) # Pequeno delay
             puuid = get_puuid(player['summonerId'])
             
         if not puuid:
@@ -421,10 +429,9 @@ def run():
         
         # 2. Lista de Partidas
         print_progress(p_idx, total_players, p_name, 0, MATCHES_PER_PLAYER, total_saved, "Listando Partidas...")
-        time.sleep(0.8)
+        time.sleep(0.5) 
         match_ids = get_match_ids(puuid, count=MATCHES_PER_PLAYER)
         
-        # Se não achou partidas, avança
         if not match_ids: continue
         
         # 3. Processamento das Partidas
@@ -432,36 +439,47 @@ def run():
             current_status = ""
             stop_player = False
             
-            # Passo A: Verifica Cache (Otimização)
+            # Passo A: Verifica Cache (Memória + DB)
             if m_id in processed_matches:
-                current_status = "Cache Local"
-            elif match_exists_in_db(conn, m_id):
-                current_status = "Cache DB"
-                processed_matches.add(m_id)
+                current_status = "Já existe"
+                # Não paramos o loop aqui, pois o jogador pode ter jogado uma partida NOVA
+                # que já foi baixada por OUTRO jogador, mas ainda precisamos checar se
+                # as próximas partidas dele são antigas ou novas.
+                # Como a lista vem ordenada cronologicamente (mais nova -> mais velha),
+                # se já existe, provavelmente é do patch atual. Continuamos verificando.
             else:
                 # Passo B: Download Real
-                time.sleep(0.8)
+                time.sleep(1.2) # Respeitando Rate Limit (100 reqs/2 min = ~0.83 reqs/seg)
                 details = get_match_details(m_id)
                 
                 if details:
                     try:
-                        # Verifica Patch
-                        if details['info']['gameVersion'].startswith(patch_prefix):
-                            time.sleep(0.8)
+                        game_version = details['info']['gameVersion']
+                        
+                        # VERIFICAÇÃO CRÍTICA DO PATCH
+                        if game_version.startswith(patch_prefix):
+                            # É do patch atual -> Baixa Timeline e Salva
+                            time.sleep(1.2)
                             timeline = get_match_timeline(m_id)
-                            save_match_full(details, timeline, conn)
-                            total_saved += 1
-                            current_status = "Salvo!"
+                            
+                            if save_match_full(details, timeline, conn):
+                                total_saved += 1
+                                processed_matches.add(m_id) # Adiciona ao cache
+                                current_status = "Salvo!"
+                            else:
+                                current_status = "Erro Salvar"
+                                
                         else:
-                            current_status = "Patch Antigo"
-                            stop_player = True
+                            # Encontrou partida de patch antigo
+                            # Como a lista é ordenada, TODAS as próximas também serão antigas.
+                            current_status = f"Patch Antigo ({game_version})"
+                            stop_player = True # Pula para o próximo jogador
+                            
                     except Exception as e:
-                        current_status = f"Erro: {str(e)}"
+                        current_status = f"Erro: {str(e)[:10]}"
                 else:
                     current_status = "Erro Download"
                 
-                processed_matches.add(m_id)
-            
             # Atualiza Barra
             print_progress(p_idx, total_players, p_name, m_idx + 1, len(match_ids), total_saved, current_status)
             

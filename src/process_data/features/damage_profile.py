@@ -1,12 +1,55 @@
 import pandas as pd
 
-def acalculate_damage_profile(blue_ids, red_ids, patch, df_champs):
+# Exceções manuais para campeões cuja Tag não reflete o tipo de dano principal.
+# 1 = Predominantemente Mágico (AP)
+# 0 = Híbrido / Dano Misto
+# -1 = Predominantemente Físico (AD)
+SPECIAL_CASES = {
+    # Atiradores que causam dano Mágico ou Híbrido
+    'Corki': 1,        # Passiva converte AA em Mágico + Skills Mágicas
+    'Kog\'Maw': 0,     # Dano Híbrido significativo (W + R)
+    'Kai\'Sa': 0,      # Frequentemente builda Híbrido/AP
+    'Varus': 0,        # Builds de AP ou On-hit híbrido são comuns
+    'Twitch': 0,       # Veneno (True) + Builds AP
+    'Kayle': 1,        # Late game é majoritariamente ondas de dano mágico
+    'Teemo': 1,        # Marksman/Mage -> Dano Mágico
+    'Azir': 1,         # Marksman (Soldados) -> Dano Mágico
+
+    # Lutadores/Tanques que causam dano Mágico (AP Bruisers)
+    'Gwen': 1,         # Fighter -> Dano Mágico
+    'Mordekaiser': 1,  # Fighter -> Dano Mágico
+    'Rumble': 1,       # Fighter -> Dano Mágico
+    'Singed': 1,       # Tank/Fighter -> Dano Mágico
+    'Lillia': 1,       # Fighter -> Dano Mágico
+    'Diana': 1,        # Fighter -> Dano Mágico
+    'Gragas': 1,       # Fighter/Tank -> Dano Mágico
+    'Volibear': 0,     # Híbrido (Raios/Mordida)
+    'Warwick': 0,      # Dano Mágico na passiva/Q/R, builda AD/Tank
+    'Udyr': 0,         # Fênix (Mágico) ou Tigre (Físico) - Híbrido por segurança
+    'Shyvana': 0,      # Híbrido (Dano base mágico alto)
+
+    # Assassinos de Dano Mágico (que as vezes não tem tag Mage)
+    'Akali': 1,
+    'Evelynn': 1,
+    'Ekko': 1,
+    'Fizz': 1,
+    'Katarina': 1,
+    'Kassadin': 1,
+    'Nidalee': 1,
+    'Elise': 1,
+    'Shaco': 0         # Caixinhas (AP) ou Crítico (AD) -> Híbrido
+}
+
+def calculate_damage_profile(blue_ids, red_ids, patch, df_champs):
     """
-    Calcula o perfil de dano do time.
+    Calcula o perfil de dano do time baseado em TAGS e EXCEÇÕES (Dados Estáticos).
+    
     Lógica:
-        - Classes AD (Marksman, Fighter, Assassin) contam como -1.
-        - Classes AP (Mage) contam como +1.
-        - Outros (Tank, Support puro) contam como 0 (Neutro).
+        1. Verifica lista de exceções (Hardcoded).
+        2. Se não for exceção, usa Tags:
+           - Mage = +1 (AP)
+           - Marksman/Fighter/Assassin = -1 (AD)
+           - Outros = 0
     
     Retorno:
         Valor negativo: Tendência AD.
@@ -31,12 +74,20 @@ def acalculate_damage_profile(blue_ids, red_ids, patch, df_champs):
         
         score = 0
         
-        for tags_str in team_df['tags']:
-            # As tags vêm como string "Mage, Support" ou "Fighter"
-            # Precisamos normalizar para garantir a busca correta
-            t = str(tags_str)
+        if team_df.empty:
+            return 0
+
+        for _, champ_row in team_df.iterrows():
+            name = champ_row['name']
+            tags_str = champ_row['tags']
             
-            # ORDEM DE PRIORIDADE IMPORTA AQUI
+            # --- VERIFICAÇÃO DE EXCEÇÃO (Hardcoded) ---
+            if name in SPECIAL_CASES:
+                score += SPECIAL_CASES[name]
+                continue # Pula a lógica de tags se já achou exceção
+            
+            # --- LÓGICA PADRÃO DE TAGS ---
+            t = str(tags_str) if pd.notna(tags_str) else ""
             
             # Se tem Mage na tag, quase sempre causa dano mágico predominante
             # (Ex: Ahri é Mage/Assassin -> AP | Sylas é Mage/Fighter -> AP)
@@ -47,9 +98,7 @@ def acalculate_damage_profile(blue_ids, red_ids, patch, df_champs):
             elif 'Marksman' in t or 'Fighter' in t or 'Assassin' in t:
                 score -= 1
             
-            # Tanks e Supports (sem tag Mage) ficam como 0
-            # Isso ajuda a não "puxar" o score erradamente. 
-            # Um Tank causa pouco dano, então ele é neutro no perfil ofensivo.
+            # Tanks e Supports puros ficam como 0 (Neutros)
             
         return score
 

@@ -13,25 +13,25 @@ try:
     from src.process_data.features.damage_profile import calculate_damage_profile
     from src.process_data.features.classes import calculate_class_counts
     from src.process_data.features.lane_matchups import calculate_lane_matchups
-    # NOVO: Importa o fixador de roles
     from src.process_data.features.role_fixer import resolve_team_roles
+    from src.process_data.features.live_prediction import calculate_live_features
+    from src.process_data.features.winrates import RollingWinrate
 except ImportError:
-    # Fallback para execução direta
     from features.mechanics import calculate_mechanics
     from features.stats import calculate_stats
     from features.damage_profile import calculate_damage_profile
     from features.classes import calculate_class_counts
     from features.lane_matchups import calculate_lane_matchups
     from features.role_fixer import resolve_team_roles
+    from features.live_prediction import calculate_live_features
+    from features.winrates import RollingWinrate
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 DB_PATH = os.path.join(BASE_DIR, 'data', 'lol_database.db')
 
 def load_reference_data(conn):
-    """Carrega dados de Champions respeitando o Schema existente."""
-    print("Carregando dados de referência...")
-    
-    # Nota: Mantendo nomes snake_case conforme seu banco de dados
+    print("Carregando dados estáticos...")
+    # Restaurando todas as colunas necessárias para os cálculos de stats e mecânicas
     query_champs = """
         SELECT 
             champion_key, patch_version, name, tags,
@@ -47,30 +47,23 @@ def load_reference_data(conn):
         FROM champions
     """
     df_champs = pd.read_sql(query_champs, conn)
-    
     query_features = "SELECT * FROM champion_features"
     df_features = pd.read_sql(query_features, conn)
-    
     return df_champs, df_features
 
 def create_dynamic_table(conn, feature_keys):
-    """Cria a tabela 'game_features'."""
     cursor = conn.cursor()
-    
     cursor.execute("DROP TABLE IF EXISTS game_features")
     
     columns_sql = [
         "match_id TEXT PRIMARY KEY",
         "patch_version TEXT",
-        "winner_team INTEGER" # 1 (Blue) ou 0 (Red)
+        "winner_team INTEGER"
     ]
-    
     for key in feature_keys:
         columns_sql.append(f"{key} REAL")
         
     sql = f"CREATE TABLE game_features ({', '.join(columns_sql)})"
-    
-    print(f"Criando tabela 'game_features' com {len(columns_sql)} colunas...")
     cursor.execute(sql)
     conn.commit()
 
@@ -78,123 +71,118 @@ def run_orchestrator():
     start_time = time.time()
     conn = sqlite3.connect(DB_PATH)
     
-    # 1. Carrega Referências
     try:
         df_champs, df_features_ref = load_reference_data(conn)
     except Exception as e:
-        print(f"ERRO AO CARREGAR DADOS DE CAMPEÕES: {e}")
+        print(f"Erro ao carregar referências: {e}")
         return
 
-    # 2. Busca Partidas
-    print("Buscando partidas no banco...")
-    
-    # ATUALIZADO: Inclui spell1Id e spell2Id para o Role Fixer
+    print("Buscando partidas ordenadas por tempo...")
     query_matches = """
         SELECT m.match_id, m.game_version, m.winner_team, 
-               p.team_id, p.champion_id, p.lane, p.role,
-               p.spell1Id, p.spell2Id
+               p.team_id, p.champion_id, p.lane, p.role
         FROM matches m
         JOIN match_participants p ON m.match_id = p.match_id
+        ORDER BY m.match_id ASC
     """
     df_matches = pd.read_sql(query_matches, conn)
-    grouped_matches = df_matches.groupby('match_id')
+    unique_match_ids = df_matches['match_id'].unique()
     
-    print(f"Total de partidas encontradas: {len(grouped_matches)}")
-    
+    winrate_model = RollingWinrate()
     rows_to_insert = []
     feature_columns_order = [] 
     table_created = False
-    
     processed_count = 0
-    saved_count = 0
-    dropped_count = 0
-    
-    for match_id, group in grouped_matches:
-        processed_count += 1
+    grouped_matches = df_matches.groupby('match_id')
+
+    # Ordem canónica das posições para garantir consistência nas features
+    ROLE_ORDER = ['TOP', 'JUNGLE', 'MIDDLE', 'BOTTOM', 'UTILITY']
+
+    for match_id in unique_match_ids:
+        group = grouped_matches.get_group(match_id)
         first_row = group.iloc[0]
         patch = ".".join(first_row['game_version'].split(".")[:2])
+        winner = 1 if int(first_row['winner_team']) == 100 else 0
         
-        # --- CORREÇÃO DO WINNER TEAM ---
-        # Converte para int nativo (evita bug numpy/sqlite)
-        raw_winner = int(first_row['winner_team'])
-        winner = 1 if raw_winner == 100 else 0
-        
-        # Separa os DataFrames dos times
         df_blue = group[group['team_id'] == 100]
         df_red = group[group['team_id'] == 200]
         
-        # Validação Básica: Precisa ter 5 linhas no DB para cada lado
-        if len(df_blue) < 5 or len(df_red) < 5:
-            dropped_count += 1
-            continue
+        if len(df_blue) < 5 or len(df_red) < 5: continue
 
-        # --- TENTATIVA DE CORREÇÃO DE ROLES (ROLE FIXER) ---
-        # Usa Tags + Smite/Spells para resolver duplicatas
+        # Resolve posições
         blue_roles_dict = resolve_team_roles(df_blue, df_champs)
         red_roles_dict = resolve_team_roles(df_red, df_champs)
+
+        # CRUCIAL: Criar listas baseadas na ROLE_ORDER para o RollingWinrate funcionar por posição
+        blue_list = [blue_roles_dict.get(role, 0) for role in ROLE_ORDER]
+        red_list = [red_roles_dict.get(role, 0) for role in ROLE_ORDER]
         
-        # Cria as listas limpas baseadas no dicionário resolvido
-        blue_list = list(blue_roles_dict.values())
-        red_list = list(red_roles_dict.values())
-        
-        # Validação Final: Se mesmo após o fix não tivermos 5 campeões únicos
-        if len(set(blue_list)) < 5 or len(set(red_list)) < 5:
-            dropped_count += 1
-            # print(f"[WARN] Dropando {match_id} - Erro grave de integridade.")
-            continue
+        # Ignora partidas onde a resolução de roles falhou (ex: IDs duplicados ou roles faltando)
+        if 0 in blue_list or 0 in red_list: continue
             
-        # --- CÁLCULO DE FEATURES ---
-        
-        # Features Globais (Usam a lista limpa)
+        # 1. Features Estáticas e Matchups
         feat_mech = calculate_mechanics(blue_list, red_list, patch, df_features_ref)
         feat_stats = calculate_stats(blue_list, red_list, patch, df_champs)
         feat_dmg = calculate_damage_profile(blue_list, red_list, patch, df_champs)
         feat_class = calculate_class_counts(blue_list, red_list, patch, df_champs)
-        
-        # Features de Lane (Usam o dicionário corrigido com posições inferidas)
         feat_lane = calculate_lane_matchups(blue_roles_dict, red_roles_dict, patch, df_champs, df_features_ref)
         
-        # Merge de tudo
-        all_features = {**feat_mech, **feat_stats, **feat_dmg, **feat_class, **feat_lane}
+        # 2. Features de Winrate (Rolling) - Agora inclui diferenciais por posição
+        feat_rolling = winrate_model.get_features(blue_list, red_list)
         
-        # Setup da tabela na primeira iteração válida
+        # 3. Live Prediction (Timeline)
+        query_ts = "SELECT * FROM match_timeline_stats WHERE match_id = ?"
+        df_ts = pd.read_sql(query_ts, conn, params=(match_id,))
+        query_tp = """
+            SELECT tp.*, p.champion_id FROM match_timeline_participants tp
+            JOIN match_participants p ON tp.match_id = p.match_id AND tp.participant_id = p.participant_id
+            WHERE tp.match_id = ?
+        """
+        df_tp = pd.read_sql(query_tp, conn, params=(match_id,))
+        feat_live = calculate_live_features(match_id, blue_roles_dict, red_roles_dict, df_ts, df_tp)
+
+        # 4. Identity IDs
+        feat_ids = {}
+        for i, role in enumerate(ROLE_ORDER):
+            r_label = ['top', 'jungle', 'mid', 'adc', 'sup'][i]
+            feat_ids[f'blue_{r_label}_id'] = blue_list[i]
+            feat_ids[f'red_{r_label}_id'] = red_list[i]
+
+        # 5. Merge
+        all_features = {
+            **feat_mech, **feat_stats, **feat_dmg, **feat_class, 
+            **feat_lane, **feat_live, **feat_ids, **feat_rolling 
+        }
+        
         if not table_created:
             feature_columns_order = list(all_features.keys())
             create_dynamic_table(conn, feature_columns_order)
             table_created = True
             
-        # Montagem da linha
         row_values = [match_id, patch, winner]
         for key in feature_columns_order:
             row_values.append(all_features.get(key, 0))
             
         rows_to_insert.append(tuple(row_values))
-        saved_count += 1
         
-        if processed_count % 500 == 0:
-            print(f"Processadas: {processed_count} | Salvas: {saved_count} | Dropadas: {dropped_count}")
+        # 6. Atualização do Aprendizado (Update DEPOIS de extrair as features)
+        winrate_model.update(blue_list, red_list, winner)
 
-    # 4. Salvar no Banco
+        processed_count += 1
+        if processed_count % 500 == 0:
+            print(f"Processadas: {processed_count}")
+
     if rows_to_insert:
-        print(f"\nSalvando {len(rows_to_insert)} linhas na tabela 'game_features'...")
-        print(f"Total dropadas (irrecuperáveis): {dropped_count}")
-        
+        print(f"\nSalvando {len(rows_to_insert)} partidas em game_features...")
         cursor = conn.cursor()
         total_cols = 3 + len(feature_columns_order)
         placeholders = ",".join(["?"] * total_cols)
         sql = f"INSERT OR REPLACE INTO game_features VALUES ({placeholders})"
-        
-        try:
-            cursor.executemany(sql, rows_to_insert)
-            conn.commit()
-            print("Sucesso! Tabela populada.")
-        except Exception as e:
-            print(f"Erro ao salvar no banco: {e}")
-    else:
-        print("Nenhuma partida válida foi gerada.")
-
+        cursor.executemany(sql, rows_to_insert)
+        conn.commit()
+    
     conn.close()
-    print(f"Orquestração finalizada em {time.time() - start_time:.2f} segundos.")
+    print(f"Concluído em {time.time() - start_time:.2f}s")
 
 if __name__ == "__main__":
     run_orchestrator()

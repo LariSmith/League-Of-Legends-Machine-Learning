@@ -1,44 +1,90 @@
-import requests
+import sqlite3
+import pandas as pd
+import numpy as np
+import os
 
-# --- COLAR CHAVE AQUI ---
-# Certifique-se que não há espaços antes do R ou depois do último caractere
-API_KEY = "RGAPI-11d4cc33-0ca8-48c0-8619-f550d0fc50d9" 
-# ------------------------
+# Configuração do caminho (ajuste se necessário)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+DB_PATH = os.path.join(BASE_DIR, 'data', 'lol_database.db')
 
-def testar_conexao():
-    # Vamos testar um endpoint simples (Rotação de Campeões) que exige chave
-    url = "https://br1.api.riotgames.com/lol/platform/v3/champion-rotations"
+def run_audit():
+    if not os.path.exists(DB_PATH):
+        print(f"Erro: Banco de dados não encontrado em {DB_PATH}")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
     
-    headers = {
-        "X-Riot-Token": API_KEY.strip() # .strip() remove espaços acidentais
-    }
-
-    print(f"--- DIAGNÓSTICO ---")
-    print(f"Chave lida (primeiros 5 digitos): {API_KEY[:5]}...")
-    print(f"Tamanho da chave: {len(API_KEY)} caracteres")
+    print("--- Iniciando Auditoria da Tabela game_features ---")
     
-    try:
-        response = requests.get(url, headers=headers)
-        
-        print(f"Status Code: {response.status_code}")
-        
-        if response.status_code == 200:
-            print("✅ SUCESSO! A chave está funcionando e o Python consegue conectar.")
-            print("Dados recebidos:", list(response.json().keys()))
-        elif response.status_code == 401:
-            print("❌ ERRO 401: Não autorizado.")
-            print("Causas prováveis:")
-            print("1. A chave no código não é EXATAMENTE a do site.")
-            print("2. Você salvou o arquivo antes de rodar?")
-            print("3. A chave expirou (mas sua imagem diz que não).")
-        elif response.status_code == 403:
-            print("⚠️ ERRO 403: Proibido.")
-            print("Sua chave é válida, mas não tem permissão para esse endpoint específico.")
-        else:
-            print(f"Erro inesperado: {response.text}")
-            
-    except Exception as e:
-        print(f"Erro de conexão (Internet/DNS): {e}")
+    # 1. Carregamento dos dados
+    df = pd.read_sql("SELECT * FROM game_features", conn)
+    conn.close()
+
+    if df.empty:
+        print("A tabela está vazia!")
+        return
+
+    total_rows = len(df)
+    print(f"Total de registros: {total_rows}")
+
+    # 2. Verificação de Nulos e Zeros
+    print("\n--- Integridade de Dados ---")
+    null_counts = df.isnull().sum().sum()
+    print(f"Valores nulos encontrados: {null_counts}")
+    
+    # Verificar se os IDs de campeões foram preenchidos
+    id_cols = [c for c in df.columns if '_id' in c]
+    zero_ids = (df[id_cols] == 0).sum().sum()
+    print(f"IDs de campeões zerados: {zero_ids} (Esperado: 0 se o role_fixer funcionou)")
+
+    # 3. Auditoria Específica de Winrates (A nova implementação)
+    wr_cols = [
+        'blue_avg_winrate', 'red_avg_winrate', 'winrate_diff_total',
+        'diff_winrate_top', 'diff_winrate_jungle', 'diff_winrate_mid', 
+        'diff_winrate_adc', 'diff_winrate_support'
+    ]
+    
+    print("\n--- Estatísticas de Rolling Winrates ---")
+    wr_stats = df[wr_cols].describe().loc[['mean', 'min', 'max', 'std']]
+    print(wr_stats)
+
+    # Verificação de Variância (Rolling Windows devem variar conforme as partidas passam)
+    # Se o std for 0, as estatísticas não estão sendo atualizadas.
+    for col in wr_cols:
+        if df[col].std() == 0:
+            print(f"ALERTA: Feature {col} tem variância ZERO. Verifique se o update() está funcionando.")
+
+    # 4. Verificação de Consistência Matemática
+    # winrate_diff_total deve ser igual a blue_avg - red_avg
+    calc_diff = df['blue_avg_winrate'] - df['red_avg_winrate']
+    error = np.abs(df['winrate_diff_total'] - calc_diff).max()
+    print(f"\nErro máximo de cálculo (diff_total): {error:.6f}")
+
+    # 5. Evolução Temporal (Check de Data Leakage vs Aprendizado)
+    # Nas primeiras partidas, os winrates devem estar muito próximos de 0.5 (devido ao Laplace)
+    # No final, a dispersão deve ser maior.
+    print("\n--- Verificação de Evolução (Rolling Window) ---")
+    first_100 = df.head(100)['winrate_diff_total'].std()
+    last_100 = df.tail(100)['winrate_diff_total'].std()
+    print(f"Desvio Padrão (Primeiras 100): {first_100:.4f}")
+    print(f"Desvio Padrão (Últimas 100): {last_100:.4f}")
+    
+    if last_100 > first_100:
+        print("OK: A variância aumentou, indicando que o modelo acumulou histórico.")
+    else:
+        print("AVISO: A variância não aumentou. Pode haver poucos dados ou erro no update.")
+
+    # 6. Correlação com o Vencedor (Poder Preditivo)
+    print("\n--- Correlação com winner_team (Target) ---")
+    correlations = df[wr_cols + ['winner_team']].corr()['winner_team'].sort_values(ascending=False)
+    print(correlations)
+
+    # 7. Check de Features "Live" (10 e 20 min)
+    live_cols = [c for c in df.columns if 'live_' in c]
+    if live_cols:
+        print("\n--- Check de Dados Live (Timeline) ---")
+        live_zeros = (df[live_cols] == 0).sum().mean()
+        print(f"Média de zeros em colunas live: {live_zeros:.2f} (Comum em jogos que terminam cedo)")
 
 if __name__ == "__main__":
-    testar_conexao()
+    run_audit()
