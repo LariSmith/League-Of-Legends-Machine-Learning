@@ -16,6 +16,7 @@ try:
     from src.process_data.features.role_fixer import resolve_team_roles
     from src.process_data.features.live_prediction import calculate_live_features
     from src.process_data.features.winrates import RollingWinrate
+    from src.process_data.features.player_proficiency import PlayerProficiency
 except ImportError:
     from features.mechanics import calculate_mechanics
     from features.stats import calculate_stats
@@ -25,13 +26,13 @@ except ImportError:
     from features.role_fixer import resolve_team_roles
     from features.live_prediction import calculate_live_features
     from features.winrates import RollingWinrate
+    from features.player_proficiency import PlayerProficiency
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 DB_PATH = os.path.join(BASE_DIR, 'data', 'lol_database.db')
 
 def load_reference_data(conn):
     print("Carregando dados estáticos...")
-    # Restaurando todas as colunas necessárias para os cálculos de stats e mecânicas
     query_champs = """
         SELECT 
             champion_key, patch_version, name, tags,
@@ -78,9 +79,11 @@ def run_orchestrator():
         return
 
     print("Buscando partidas ordenadas por tempo...")
+    # Precisamos de 'puuid' na query inicial agora
     query_matches = """
         SELECT m.match_id, m.game_version, m.winner_team, 
-               p.team_id, p.champion_id, p.lane, p.role
+               p.team_id, p.champion_id, p.lane, p.role, p.puuid,
+               p.spell1Id, p.spell2Id
         FROM matches m
         JOIN match_participants p ON m.match_id = p.match_id
         ORDER BY m.match_id ASC
@@ -89,13 +92,14 @@ def run_orchestrator():
     unique_match_ids = df_matches['match_id'].unique()
     
     winrate_model = RollingWinrate()
+    proficiency_model = PlayerProficiency()
+
     rows_to_insert = []
     feature_columns_order = [] 
     table_created = False
     processed_count = 0
     grouped_matches = df_matches.groupby('match_id')
 
-    # Ordem canónica das posições para garantir consistência nas features
     ROLE_ORDER = ['TOP', 'JUNGLE', 'MIDDLE', 'BOTTOM', 'UTILITY']
 
     for match_id in unique_match_ids:
@@ -109,49 +113,64 @@ def run_orchestrator():
         
         if len(df_blue) < 5 or len(df_red) < 5: continue
 
-        # Resolve posições
+        # Resolve posições (agora retorna dict com {'id', 'puuid'})
         blue_roles_dict = resolve_team_roles(df_blue, df_champs)
         red_roles_dict = resolve_team_roles(df_red, df_champs)
 
-        # CRUCIAL: Criar listas baseadas na ROLE_ORDER para o RollingWinrate funcionar por posição
-        blue_list = [blue_roles_dict.get(role, 0) for role in ROLE_ORDER]
-        red_list = [red_roles_dict.get(role, 0) for role in ROLE_ORDER]
-        
-        # Ignora partidas onde a resolução de roles falhou (ex: IDs duplicados ou roles faltando)
-        if 0 in blue_list or 0 in red_list: continue
+        # Extração de IDs para features legadas
+        # Verifica se alguma role não foi preenchida
+        if len(blue_roles_dict) < 5 or len(red_roles_dict) < 5:
+            continue
             
+        blue_list = [blue_roles_dict[role]['id'] for role in ROLE_ORDER]
+        red_list = [red_roles_dict[role]['id'] for role in ROLE_ORDER]
+
+        # Extração de Participants para PlayerProficiency (preservando PUUID)
+        # Monta lista de dicts com 'puuid' e 'champion_id'
+        blue_participants = [{'puuid': blue_roles_dict[role]['puuid'], 'champion_id': blue_roles_dict[role]['id']} for role in ROLE_ORDER]
+        red_participants = [{'puuid': red_roles_dict[role]['puuid'], 'champion_id': red_roles_dict[role]['id']} for role in ROLE_ORDER]
+
         # 1. Features Estáticas e Matchups
+        # Adaptação para lane_matchups que espera dict de IDs simples
+        blue_roles_simple = {k: v['id'] for k, v in blue_roles_dict.items()}
+        red_roles_simple = {k: v['id'] for k, v in red_roles_dict.items()}
+
         feat_mech = calculate_mechanics(blue_list, red_list, patch, df_features_ref)
         feat_stats = calculate_stats(blue_list, red_list, patch, df_champs)
         feat_dmg = calculate_damage_profile(blue_list, red_list, patch, df_champs)
         feat_class = calculate_class_counts(blue_list, red_list, patch, df_champs)
-        feat_lane = calculate_lane_matchups(blue_roles_dict, red_roles_dict, patch, df_champs, df_features_ref)
+        feat_lane = calculate_lane_matchups(blue_roles_simple, red_roles_simple, patch, df_champs, df_features_ref)
         
-        # 2. Features de Winrate (Rolling) - Agora inclui diferenciais por posição
+        # 2. Features de Winrate (Rolling)
         feat_rolling = winrate_model.get_features(blue_list, red_list)
         
-        # 3. Live Prediction (Timeline)
+        # 3. Player Proficiency Features (NOVIDADE)
+        feat_prof = proficiency_model.get_features(blue_participants, red_participants, patch)
+
+        # 4. Live Prediction (Timeline)
         query_ts = "SELECT * FROM match_timeline_stats WHERE match_id = ?"
         df_ts = pd.read_sql(query_ts, conn, params=(match_id,))
         query_tp = """
-            SELECT tp.*, p.champion_id FROM match_timeline_participants tp
+            SELECT tp.*, p.champion_id, p.puuid, p.participant_id
+            FROM match_timeline_participants tp
             JOIN match_participants p ON tp.match_id = p.match_id AND tp.participant_id = p.participant_id
             WHERE tp.match_id = ?
         """
         df_tp = pd.read_sql(query_tp, conn, params=(match_id,))
-        feat_live = calculate_live_features(match_id, blue_roles_dict, red_roles_dict, df_ts, df_tp)
+        feat_live = calculate_live_features(match_id, blue_roles_simple, red_roles_simple, df_ts, df_tp)
 
-        # 4. Identity IDs
+        # 5. Identity IDs
         feat_ids = {}
         for i, role in enumerate(ROLE_ORDER):
             r_label = ['top', 'jungle', 'mid', 'adc', 'sup'][i]
             feat_ids[f'blue_{r_label}_id'] = blue_list[i]
             feat_ids[f'red_{r_label}_id'] = red_list[i]
 
-        # 5. Merge
+        # 6. Merge All
         all_features = {
             **feat_mech, **feat_stats, **feat_dmg, **feat_class, 
-            **feat_lane, **feat_live, **feat_ids, **feat_rolling 
+            **feat_lane, **feat_live, **feat_ids, **feat_rolling,
+            **feat_prof
         }
         
         if not table_created:
@@ -165,8 +184,18 @@ def run_orchestrator():
             
         rows_to_insert.append(tuple(row_values))
         
-        # 6. Atualização do Aprendizado (Update DEPOIS de extrair as features)
+        # 7. Atualização dos Modelos (Rolling & Proficiency)
         winrate_model.update(blue_list, red_list, winner)
+
+        # Proficiency Update precisa de dados completos dos participantes
+        # Busca detalhes extras (kills, deaths, win, etc) para o update
+        query_part_details = """
+            SELECT puuid, champion_id, participant_id, win, kills, deaths, assists
+            FROM match_participants
+            WHERE match_id = ?
+        """
+        df_part_details = pd.read_sql(query_part_details, conn, params=(match_id,))
+        proficiency_model.update_with_patch(df_part_details, df_tp, patch)
 
         processed_count += 1
         if processed_count % 500 == 0:
