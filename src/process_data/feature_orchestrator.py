@@ -128,7 +128,7 @@ def run_orchestrator():
         feat_lane = calculate_lane_matchups(blue_roles_dict, red_roles_dict, patch, df_champs, df_features_ref)
         
         # 2. Features de Winrate (Rolling) - Agora inclui diferenciais por posição
-        feat_rolling = winrate_model.get_features(blue_list, red_list)
+        feat_rolling = winrate_model.get_features(blue_list, red_list, patch)
         
         # 3. Live Prediction (Timeline)
         query_ts = "SELECT * FROM match_timeline_stats WHERE match_id = ?"
@@ -166,7 +166,7 @@ def run_orchestrator():
         rows_to_insert.append(tuple(row_values))
         
         # 6. Atualização do Aprendizado (Update DEPOIS de extrair as features)
-        winrate_model.update(blue_list, red_list, winner)
+        winrate_model.update(blue_list, red_list, winner, patch)
 
         processed_count += 1
         if processed_count % 500 == 0:
